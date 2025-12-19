@@ -1,0 +1,3 @@
+# Ignorar arquivo de configuração com token
+mytoken.py
+__pycache__
