@@ -1,7 +1,9 @@
 import discord
 from discord.ext import commands
 import os
+import re
 import sys
+import math
 from mytoken import TOKEN
 import yt_dlp
 import asyncio
@@ -9,41 +11,71 @@ import asyncio
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
-last_bot_message = None
 
-# Global variables for control
-current_volume = 0.4
-is_playing = False
-current_music_path = None
+MUSIC_FOLDER = "music"
 
-#global for all music
-playlist = []
-playlist_index = 0
-playlist_mode = False
+
+class GuildState:
+    """Per-server playback state, so multiple servers don't share the same music/volume/playlist."""
+
+    def __init__(self):
+        self.current_volume = 0.4
+        self.is_playing = False
+        self.current_music_path = None
+        self.playlist = []
+        self.playlist_index = 0
+        self.playlist_mode = False
+        self.last_bot_message = None
+
+
+guild_states = {}
+
+
+def get_state(ctx):
+    return guild_states.setdefault(ctx.guild.id, GuildState())
+
+
+def get_music_files():
+    """Map of song name (without extension) -> actual filename on disk."""
+    if not os.path.isdir(MUSIC_FOLDER):
+        return {}
+
+    return {
+        os.path.splitext(f)[0]: f
+        for f in os.listdir(MUSIC_FOLDER)
+        if f.lower().endswith(".mp3")
+    }
 
 
 def find_music_by_prefix(prefix):
-    music_folder = "music"
-
-    if not os.path.isdir(music_folder):
-        return None, []
-
-    files = os.listdir(music_folder)
-
-    musics = [
-        os.path.splitext(f)[0]
-        for f in files
-        if f.lower().endswith(".mp3")
-    ]
-
+    # NOTE: don't call the builtin list() here - the `list` Discord command below
+    # shadows the builtin name at module scope once the bot is loaded.
+    names = [*get_music_files().keys()]
     prefix = prefix.lower()
 
-    matches = [m for m in musics if m.lower().startswith(prefix)]
+    for name in names:
+        if name.lower() == prefix:
+            return name, [name]
+
+    matches = [name for name in names if name.lower().startswith(prefix)]
 
     return (matches[0] if len(matches) == 1 else None), matches
 
+
+def safe_filename(name):
+    """Strip anything that could escape the music folder (path separators, traversal)."""
+    if not name:
+        return None
+
+    name = os.path.basename(name)
+    name = re.sub(r'[^A-Za-z0-9 _.-]', '', name).strip()
+
+    return name or None
+
+
 def download_audio(url, filename=None):
-    output_template = f"music/{filename}.%(ext)s" if filename else "music/%(title)s.%(ext)s"
+    filename = safe_filename(filename)
+    output_template = f"{MUSIC_FOLDER}/{filename}.%(ext)s" if filename else f"{MUSIC_FOLDER}/%(title)s.%(ext)s"
 
     ydl_opts = {
         'format': 'bestaudio/best',
@@ -55,45 +87,44 @@ def download_audio(url, filename=None):
         }],
         'quiet': True,
         'js_runtimes': {
-            'node':{}
+            'node': {}
         },
-        'headers': {
+        'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
         },
-        'force-ipv4': True,
-        'no-check-certificate': True,
-        'geo-bypass': True,
-        'extract-audio': True,  # Audio extraction only
-        'audio-quality': '320k',  # Audio quality
+        'source_address': '0.0.0.0',  # force IPv4
+        'nocheckcertificate': True,
+        'geo_bypass': True,
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
 
 async def send_clean(ctx, content):
-    global last_bot_message
+    state = get_state(ctx)
+
     # Delete the user's message
     try:
         await ctx.message.delete()
-    except:
+    except Exception:
         pass  # ignore if we don't have permission
 
     # Delete the bot's last message, if it exists
     try:
-        if last_bot_message:
-            await last_bot_message.delete()
-    except:
+        if state.last_bot_message:
+            await state.last_bot_message.delete()
+    except Exception:
         pass
 
     # Send the new message and store it
-    last_bot_message = await ctx.send(content)
+    state.last_bot_message = await ctx.send(content)
 
 @bot.event
 async def on_ready():
     print(f"Bot connected as {bot.user}")
     try:
         print(f"Python executable: {sys.executable}")
-    except:
+    except Exception:
         pass
     # Detect available voice backends
     backends = []
@@ -112,10 +143,10 @@ async def on_ready():
 # Command to play music in loop
 @bot.command()
 async def play(ctx, name):
-    global is_playing, current_music_path
+    state = get_state(ctx)
 
     if not ctx.author.voice:
-        await ctx.send("you gotta be in a voice channel first")
+        await send_clean(ctx, "you gotta be in a voice channel first")
         return
 
     channel = ctx.author.voice.channel
@@ -123,17 +154,15 @@ async def play(ctx, name):
     if not ctx.voice_client:
         try:
             await channel.connect()
-        except RuntimeError as e:
+        except (RuntimeError, discord.ClientException, asyncio.TimeoutError, discord.opus.OpusNotLoaded) as e:
             msg = str(e)
-            if 'pynacl' in msg.lower() or 'pyNaCl' in msg or 'PyNaCl' in msg:
+            if 'pynacl' in msg.lower():
                 await send_clean(ctx, "missing PyNaCl, can't do voice without it. run `python -m pip install PyNaCl` and restart me")
-                return
             else:
                 await send_clean(ctx, f"couldn't connect to voice: {msg}")
-                return
+            return
 
     voice = ctx.voice_client
-
 
     music_name, matches = find_music_by_prefix(name)
 
@@ -146,39 +175,40 @@ async def play(ctx, name):
             await send_clean(ctx, "couldn't find that one")
         return
 
-    music_path = f"music/{music_name}.mp3"
+    music_path = f"{MUSIC_FOLDER}/{get_music_files()[music_name]}"
 
-    # Update global variables
-    current_music_path = music_path
-    is_playing = True
+    # A !play interrupts any running playlist
+    state.playlist_mode = False
+    state.current_music_path = music_path
+    state.is_playing = True
 
     if voice.is_playing():
         voice.stop()
     # Safe loop function
     def loop_audio(error):
-        if is_playing and voice.is_connected():
+        if state.is_playing and voice.is_connected():
             source = discord.PCMVolumeTransformer(
-                discord.FFmpegPCMAudio(current_music_path),
-                volume=current_volume
+                discord.FFmpegPCMAudio(state.current_music_path),
+                volume=state.current_volume
             )
             voice.play(source, after=loop_audio)
 
     # Play for the first time
     source = discord.PCMVolumeTransformer(
-        discord.FFmpegPCMAudio(current_music_path),
-        volume=current_volume
+        discord.FFmpegPCMAudio(state.current_music_path),
+        volume=state.current_volume
     )
     voice.play(source, after=loop_audio)
 
-    await send_clean(ctx, f"playing **{name}** on loop, `!stop` when you've had enough")
+    await send_clean(ctx, f"playing **{music_name}** on loop, `!stop` when you've had enough")
 
 # Command to stop the music
 @bot.command()
 async def stop(ctx):
-    global is_playing, playlist_mode
+    state = get_state(ctx)
 
-    is_playing = False  # Stop the loop
-    playlist_mode = False
+    state.is_playing = False  # Stop the loop
+    state.playlist_mode = False
 
     if ctx.voice_client:
         ctx.voice_client.stop()  # Stop the music
@@ -190,16 +220,17 @@ async def stop(ctx):
 # Command to adjust volume in real time
 @bot.command()
 async def volume(ctx, value: float):
-    global current_volume
-    if value < 0 or value > 2:
+    state = get_state(ctx)
+
+    if math.isnan(value) or value < 0 or value > 2:
         await send_clean(ctx, "gotta be between 0.0 and 2.0")
         return
 
-    current_volume = value
+    state.current_volume = value
     if ctx.voice_client and ctx.voice_client.source:
-        ctx.voice_client.source.volume = current_volume
+        ctx.voice_client.source.volume = state.current_volume
 
-    await send_clean(ctx, f"volume's at {current_volume} now")
+    await send_clean(ctx, f"volume's at {state.current_volume} now")
 
 @bot.command()
 async def upload(ctx, url, name: str = None):
@@ -231,26 +262,15 @@ async def upload(ctx, url, name: str = None):
         await send_clean(ctx, "downloaded, use `!play <file-name>` to hear it")
 @bot.command()
 async def list(ctx):
-    music_folder = "music"
-
-    if not os.path.isdir(music_folder):
+    if not os.path.isdir(MUSIC_FOLDER):
         await send_clean(ctx, "can't find the music folder, something's off")
         return
 
-    files = os.listdir(music_folder)
-
-    # Filter only mp3
-    musics = [
-        os.path.splitext(f)[0]
-        for f in files
-        if f.lower().endswith(".mp3")
-    ]
+    musics = sorted(get_music_files().keys())
 
     if not musics:
         await send_clean(ctx, "nothing here yet")
         return
-
-    musics.sort()
 
     message = "here's what I've got:\n"
     message += "\n".join(f"- {m}" for m in musics)
@@ -297,75 +317,72 @@ To stop the playlist:
 !stop
 """
 async def play_next(ctx):
-    global playlist_index, playlist_mode
+    state = get_state(ctx)
 
-    if not playlist_mode:
+    if not state.playlist_mode:
         return
 
-    if playlist_index >= len(playlist):
-        playlist_mode = False
+    if state.playlist_index >= len(state.playlist):
+        state.playlist_mode = False
         await send_clean(ctx, "that's the whole playlist, done")
         return
 
     voice = ctx.voice_client
 
-    music_name = playlist[playlist_index]
-    music_path = f"music/{music_name}.mp3"
+    if not voice or not voice.is_connected():
+        state.playlist_mode = False
+        return
+
+    if voice.is_playing():
+        voice.stop()
+
+    music_name = state.playlist[state.playlist_index]
+    actual_file = get_music_files().get(music_name, f"{music_name}.mp3")
+    music_path = f"{MUSIC_FOLDER}/{actual_file}"
 
     await send_clean(ctx, f"now playing: **{music_name}**")
 
     source = discord.PCMVolumeTransformer(
         discord.FFmpegPCMAudio(music_path),
-        volume=current_volume
+        volume=state.current_volume
     )
 
     def after_playing(error):
-        global playlist_index
-        playlist_index += 1
+        if error:
+            print(f"playback error: {error}")
+        state.playlist_index += 1
         fut = asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
         try:
             fut.result()
-        except:
-            pass
+        except Exception as e:
+            print(f"play_next failed: {e}")
 
     voice.play(source, after=after_playing)
 
 @bot.command()
 async def allmusic(ctx):
-    global playlist, playlist_index, playlist_mode
+    state = get_state(ctx)
 
     if not ctx.author.voice:
         await send_clean(ctx, "join a voice channel first")
         return
 
-    music_folder = "music"
-
-    if not os.path.isdir(music_folder):
-        await send_clean(ctx, "can't find the music folder, something's off")
-        return
-
-    files = os.listdir(music_folder)
-
-    musics = [
-        os.path.splitext(f)[0]
-        for f in files
-        if f.lower().endswith(".mp3")
-    ]
+    musics = sorted(get_music_files().keys())
 
     if not musics:
         await send_clean(ctx, "no music to play, folder's empty")
         return
 
-    musics.sort()
-
     if not ctx.voice_client:
         await ctx.author.voice.channel.connect()
 
-    playlist = musics
-    playlist_index = 0
-    playlist_mode = True
+    # An !allmusic interrupts any single looping track
+    state.is_playing = False
+    state.playlist = musics
+    state.playlist_index = 0
+    state.playlist_mode = True
 
-    await send_clean(ctx, f"kicking off {len(playlist)} songs")
+    await send_clean(ctx, f"kicking off {len(state.playlist)} songs")
 
     await play_next(ctx)
 
@@ -395,13 +412,13 @@ This command only works when the playlist system (!allmusic) is active.
 """
 @bot.command()
 async def next(ctx):
-    global playlist_mode
+    state = get_state(ctx)
 
     if not ctx.voice_client:
         await send_clean(ctx, "I'm not in a voice channel")
         return
 
-    if not playlist_mode:
+    if not state.playlist_mode:
         await send_clean(ctx, "no playlist going right now")
         return
 
