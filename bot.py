@@ -11,7 +11,7 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 last_bot_message = None
 
-# Variáveis globais para controle
+# Global variables for control
 current_volume = 0.4
 is_playing = False
 current_music_path = None
@@ -63,34 +63,34 @@ def download_audio(url, filename=None):
         'force-ipv4': True,
         'no-check-certificate': True,
         'geo-bypass': True,
-        'extract-audio': True,  # Extração de áudio apenas
-        'audio-quality': '320k',  # Qualidade do áudio
+        'extract-audio': True,  # Audio extraction only
+        'audio-quality': '320k',  # Audio quality
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
 
 async def send_clean(ctx, content):
-    global last_bot_message 
-    # Apaga a mensagem do usuário
+    global last_bot_message
+    # Delete the user's message
     try:
         await ctx.message.delete()
     except:
-        pass  # se não tiver permissão, ignora
+        pass  # ignore if we don't have permission
 
-    # Apaga a última mensagem do bot, se existir
+    # Delete the bot's last message, if it exists
     try:
         if last_bot_message:
             await last_bot_message.delete()
     except:
         pass
 
-    # Envia a nova mensagem e guarda ela
+    # Send the new message and store it
     last_bot_message = await ctx.send(content)
 
 @bot.event
 async def on_ready():
-    print(f"Bot conectado como {bot.user}")
+    print(f"Bot connected as {bot.user}")
     try:
         print(f"Python executable: {sys.executable}")
     except:
@@ -109,13 +109,13 @@ async def on_ready():
         pass
     print(f"Voice backends available: {', '.join(backends) if backends else 'none'}")
 
-# Comando para tocar música em loop
+# Command to play music in loop
 @bot.command()
-async def play(ctx, nome):
+async def play(ctx, name):
     global is_playing, current_music_path
 
     if not ctx.author.voice:
-        await ctx.send("Você precisa estar em um canal de voz.")
+        await ctx.send("You need to be in a voice channel.")
         return
 
     channel = ctx.author.voice.channel
@@ -126,35 +126,35 @@ async def play(ctx, nome):
         except RuntimeError as e:
             msg = str(e)
             if 'pynacl' in msg.lower() or 'pyNaCl' in msg or 'PyNaCl' in msg:
-                await send_clean(ctx, "❌ Erro: a biblioteca PyNaCl é necessária para usar voz. Instale com `python -m pip install PyNaCl` e reinicie o bot.")
+                await send_clean(ctx, "❌ Error: the PyNaCl library is required to use voice. Install it with `python -m pip install PyNaCl` and restart the bot.")
                 return
             else:
-                await send_clean(ctx, f"❌ Erro ao conectar voz: {msg}")
+                await send_clean(ctx, f"❌ Error connecting to voice: {msg}")
                 return
 
     voice = ctx.voice_client
 
-    
-    music_name, matches = find_music_by_prefix(nome)
+
+    music_name, matches = find_music_by_prefix(name)
 
     if not music_name:
         if len(matches) > 1:
-            message = "❓ Várias músicas encontradas:\n"
+            message = "❓ Multiple songs found:\n"
             message += "\n".join(f"• {m}" for m in matches)
             await send_clean(ctx, message)
         else:
-            await send_clean(ctx, "❌ Nenhuma música encontrada.")
+            await send_clean(ctx, "❌ No song found.")
         return
 
     music_path = f"music/{music_name}.mp3"
 
-    # Atualiza variáveis globais
+    # Update global variables
     current_music_path = music_path
     is_playing = True
-    
+
     if voice.is_playing():
         voice.stop()
-    # Função de loop seguro
+    # Safe loop function
     def loop_audio(error):
         if is_playing and voice.is_connected():
             source = discord.PCMVolumeTransformer(
@@ -163,52 +163,52 @@ async def play(ctx, nome):
             )
             voice.play(source, after=loop_audio)
 
-    # Toca a primeira vez
+    # Play for the first time
     source = discord.PCMVolumeTransformer(
         discord.FFmpegPCMAudio(current_music_path),
         volume=current_volume
     )
     voice.play(source, after=loop_audio)
 
-    await send_clean(ctx, f"🎵 Tocando **{nome}** em loop. Use `!stop` para parar.")
+    await send_clean(ctx, f"🎵 Playing **{name}** on loop. Use `!stop` to stop.")
 
-# Comando para parar a música
+# Command to stop the music
 @bot.command()
 async def stop(ctx):
     global is_playing, playlist_mode
 
-    is_playing = False  # Para o loop
+    is_playing = False  # Stop the loop
     playlist_mode = False
 
     if ctx.voice_client:
-        ctx.voice_client.stop()  # Para a música
-        await send_clean(ctx, "⏹️ Música parada,Status: sem musica")
+        ctx.voice_client.stop()  # Stop the music
+        await send_clean(ctx, "⏹️ Music stopped. Status: no music")
     else:
-       await send_clean(ctx, "O bot não está em um canal de voz.")
+       await send_clean(ctx, "The bot is not in a voice channel.")
 
 
-# Comando para ajustar volume em tempo real
+# Command to adjust volume in real time
 @bot.command()
 async def volume(ctx, value: float):
     global current_volume
     if value < 0 or value > 2:
-        await send_clean(ctx, "Use um valor entre 0.0 e 2.0")
+        await send_clean(ctx, "Use a value between 0.0 and 2.0")
         return
 
     current_volume = value
     if ctx.voice_client and ctx.voice_client.source:
         ctx.voice_client.source.volume = current_volume
 
-    await send_clean(ctx, f"🔊 Volume ajustado para {current_volume}")
+    await send_clean(ctx, f"🔊 Volume set to {current_volume}")
 
 @bot.command()
-async def upload(ctx, url, nome: str = None):
-    await send_clean(ctx, "⬇️ Baixando música...")
+async def upload(ctx, url, name: str = None):
+    await send_clean(ctx, "⬇️ Downloading song...")
 
     loop = asyncio.get_event_loop()
     index = url.find('&list')
-    
-    # Se encontrar o '&list', corta a URL até esse ponto
+
+    # If '&list' is found, trim the URL up to that point
     if index != -1:
         url = url[:index]
     print(url)
@@ -218,28 +218,28 @@ async def upload(ctx, url, nome: str = None):
             None,
             download_audio,
             url,
-            nome
+            name
         )
     except Exception as e:
-        await send_clean(ctx, "❌ Erro ao baixar a música.")
+        await send_clean(ctx, "❌ Error downloading the song.")
         print(e)
         return
 
-    if nome:
-        await send_clean(ctx, f"✅ Música **{nome}** adicionada! Use `!play {nome}`")
+    if name:
+        await send_clean(ctx, f"✅ Song **{name}** added! Use `!play {name}`")
     else:
-        await send_clean(ctx, "✅ Música adicionada! Use `!play <nome-do-arquivo>`")
+        await send_clean(ctx, "✅ Song added! Use `!play <file-name>`")
 @bot.command()
 async def list(ctx):
     music_folder = "music"
 
     if not os.path.isdir(music_folder):
-        await send_clean(ctx, "❌ Pasta de músicas não encontrada.")
+        await send_clean(ctx, "❌ Music folder not found.")
         return
 
     files = os.listdir(music_folder)
 
-    # Filtra apenas mp3
+    # Filter only mp3
     musics = [
         os.path.splitext(f)[0]
         for f in files
@@ -247,12 +247,12 @@ async def list(ctx):
     ]
 
     if not musics:
-        await send_clean(ctx, "📂 Nenhuma música encontrada.")
+        await send_clean(ctx, "📂 No song found.")
         return
 
     musics.sort()
 
-    message = "🎵 **Músicas disponíveis:**\n"
+    message = "🎵 **Available songs:**\n"
     message += "\n".join(f"• {m}" for m in musics)
 
     await send_clean(ctx, message)
@@ -406,9 +406,9 @@ async def next(ctx):
         return
 
     if ctx.voice_client.is_playing():
-        ctx.voice_client.stop()  # Isso ativa o after e chama play_next()
+        ctx.voice_client.stop()  # This triggers the after callback and calls play_next()
         await send_clean(ctx, "⏭️ Skipping to next music...")
     else:
         await send_clean(ctx, "❌ No music is currently playing.")
-# Inicia o bot
+# Start the bot
 bot.run(TOKEN)
