@@ -4,6 +4,7 @@ import os
 import re
 import sys
 import math
+import audioop
 from mytoken import TOKEN
 import yt_dlp
 import asyncio
@@ -13,6 +14,17 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 MUSIC_FOLDER = "music"
+
+COMMANDS_HELP = [
+    ("!play <name>", "loops a song"),
+    ("!sfx <name> [volume]", "layers a one-shot sound on top"),
+    ("!allmusic", "plays every song as a playlist"),
+    ("!next", "skips to the next playlist song"),
+    ("!stop", "stops everything"),
+    ("!volume <0-2>", "sets the volume"),
+    ("!upload <url> [name]", "downloads a song"),
+    ("!list", "shows this"),
+]
 
 
 class GuildState:
@@ -71,6 +83,91 @@ def safe_filename(name):
     name = re.sub(r'[^A-Za-z0-9 _.-]', '', name).strip()
 
     return name or None
+
+
+"""
+MIXED AUDIO SOURCE (used by !sfx)
+
+discord.py only lets one AudioSource play at a time per voice connection -
+there's no built-in way to layer a sound effect on top of whatever's
+already playing. To fake it, this wraps the currently playing source
+("base": the looping !play track or the current !allmusic track) together
+with a one-shot "overlay" source, and mixes their raw PCM audio frame by
+frame with audioop.add(). audioop.add() clips instead of wrapping on
+overflow (confirmed: 30000+30000 -> 32767), so loud overlaps get squashed
+instead of turning into digital noise.
+
+Swapping it in works because discord.py's VoiceClient.source setter
+hot-swaps the AudioSource of the currently running AudioPlayer thread
+(pauses it, replaces .source, resumes) without touching the "after"
+callback that's already registered - so the existing loop/playlist logic
+in play()/play_next() keeps working underneath the mix, undisturbed.
+
+Once the overlay runs out, read() just keeps returning the base frames -
+no need to ever "unwrap" back to the plain base source.
+"""
+class MixedAudioSource(discord.AudioSource):
+    def __init__(self, base, overlay):
+        self.base = base
+        self.overlay = overlay
+
+    @property
+    def volume(self):
+        # Forwarded so `!volume` can keep live-adjusting the base track
+        # even while a sfx is mixed in on top of it.
+        return getattr(self.base, "volume", None)
+
+    @volume.setter
+    def volume(self, value):
+        if hasattr(self.base, "volume"):
+            self.base.volume = value
+
+    def read(self):
+        base_frame = self.base.read()
+
+        if not base_frame or self.overlay is None:
+            return base_frame
+
+        overlay_frame = self.overlay.read()
+
+        if not overlay_frame:
+            self.overlay.cleanup()
+            self.overlay = None
+            return base_frame
+
+        if len(overlay_frame) < len(base_frame):
+            overlay_frame += b"\x00" * (len(base_frame) - len(overlay_frame))
+
+        return audioop.add(base_frame, overlay_frame, 2)
+
+    def is_opus(self):
+        return False
+
+    def cleanup(self):
+        self.base.cleanup()
+        if self.overlay:
+            self.overlay.cleanup()
+
+
+async def ensure_voice_connected(ctx):
+    """Connects to the author's voice channel if not already connected.
+
+    Returns the VoiceClient, or None if it already sent an error message
+    (missing PyNaCl, connection timeout, etc) - in which case the caller
+    should just return.
+    """
+    if not ctx.voice_client:
+        try:
+            await ctx.author.voice.channel.connect()
+        except (RuntimeError, discord.ClientException, asyncio.TimeoutError, discord.opus.OpusNotLoaded) as e:
+            msg = str(e)
+            if 'pynacl' in msg.lower():
+                await send_clean(ctx, "missing PyNaCl, can't do voice without it. run `python -m pip install PyNaCl` and restart me")
+            else:
+                await send_clean(ctx, f"couldn't connect to voice: {msg}")
+            return None
+
+    return ctx.voice_client
 
 
 def download_audio(url, filename=None):
@@ -149,20 +246,9 @@ async def play(ctx, name):
         await send_clean(ctx, "you gotta be in a voice channel first")
         return
 
-    channel = ctx.author.voice.channel
-
-    if not ctx.voice_client:
-        try:
-            await channel.connect()
-        except (RuntimeError, discord.ClientException, asyncio.TimeoutError, discord.opus.OpusNotLoaded) as e:
-            msg = str(e)
-            if 'pynacl' in msg.lower():
-                await send_clean(ctx, "missing PyNaCl, can't do voice without it. run `python -m pip install PyNaCl` and restart me")
-            else:
-                await send_clean(ctx, f"couldn't connect to voice: {msg}")
-            return
-
-    voice = ctx.voice_client
+    voice = await ensure_voice_connected(ctx)
+    if voice is None:
+        return
 
     music_name, matches = find_music_by_prefix(name)
 
@@ -200,7 +286,7 @@ async def play(ctx, name):
     )
     voice.play(source, after=loop_audio)
 
-    await send_clean(ctx, f"playing **{music_name}** on loop, `!stop` when you've had enough")
+    await send_clean(ctx, f"playing **{music_name}** on loop at volume {state.current_volume}, `!stop` when you've had enough")
 
 # Command to stop the music
 @bot.command()
@@ -231,6 +317,67 @@ async def volume(ctx, value: float):
         ctx.voice_client.source.volume = state.current_volume
 
     await send_clean(ctx, f"volume's at {state.current_volume} now")
+
+"""
+SFX COMMAND
+
+The !sfx command layers a one-shot sound on top of whatever's already
+playing (a looping !play track or the current !allmusic track), instead
+of replacing it. See MixedAudioSource above for how the mixing works.
+
+Usage:
+
+!sfx <name> [volume]
+
+- <name>: same prefix matching as !play, same music/ folder.
+- [volume]: optional, 0.0-2.0. Defaults to the current background volume
+  (state.current_volume) if left out.
+
+If nothing is currently playing, it just connects (if needed) and plays
+the sound once, with no loop.
+"""
+@bot.command()
+async def sfx(ctx, name, sfx_volume: float = None):
+    state = get_state(ctx)
+
+    if not ctx.author.voice:
+        await send_clean(ctx, "you gotta be in a voice channel first")
+        return
+
+    voice = await ensure_voice_connected(ctx)
+    if voice is None:
+        return
+
+    music_name, matches = find_music_by_prefix(name)
+
+    if not music_name:
+        if len(matches) > 1:
+            message = "got a few that match, which one did you mean?\n"
+            message += "\n".join(f"- {m}" for m in matches)
+            await send_clean(ctx, message)
+        else:
+            await send_clean(ctx, "couldn't find that one")
+        return
+
+    if sfx_volume is None:
+        sfx_volume = state.current_volume
+    elif math.isnan(sfx_volume) or sfx_volume < 0 or sfx_volume > 2:
+        await send_clean(ctx, "gotta be between 0.0 and 2.0")
+        return
+
+    sfx_path = f"{MUSIC_FOLDER}/{get_music_files()[music_name]}"
+    sfx_source = discord.PCMVolumeTransformer(
+        discord.FFmpegPCMAudio(sfx_path),
+        volume=sfx_volume
+    )
+
+    if voice.is_playing():
+        # Hot-swap in a mix instead of stopping the current track
+        voice.source = MixedAudioSource(voice.source, sfx_source)
+        await send_clean(ctx, f"layering **{music_name}** in at volume {sfx_volume}")
+    else:
+        voice.play(sfx_source)
+        await send_clean(ctx, f"playing **{music_name}** once at volume {sfx_volume}")
 
 @bot.command()
 async def upload(ctx, url, name: str = None):
@@ -272,7 +419,8 @@ async def list(ctx):
         await send_clean(ctx, "nothing here yet")
         return
 
-    message = "here's what I've got:\n"
+    message = "\n".join(f"`{cmd}` - {desc}" for cmd, desc in COMMANDS_HELP)
+    message += "\n\nhere's what I've got:\n"
     message += "\n".join(f"- {m}" for m in musics)
 
     await send_clean(ctx, message)
@@ -340,7 +488,7 @@ async def play_next(ctx):
     actual_file = get_music_files().get(music_name, f"{music_name}.mp3")
     music_path = f"{MUSIC_FOLDER}/{actual_file}"
 
-    await send_clean(ctx, f"now playing: **{music_name}**")
+    await send_clean(ctx, f"now playing: **{music_name}** (volume {state.current_volume})")
 
     source = discord.PCMVolumeTransformer(
         discord.FFmpegPCMAudio(music_path),
@@ -373,8 +521,8 @@ async def allmusic(ctx):
         await send_clean(ctx, "no music to play, folder's empty")
         return
 
-    if not ctx.voice_client:
-        await ctx.author.voice.channel.connect()
+    if await ensure_voice_connected(ctx) is None:
+        return
 
     # An !allmusic interrupts any single looping track
     state.is_playing = False
