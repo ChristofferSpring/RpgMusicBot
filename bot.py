@@ -399,7 +399,7 @@ async def upload(ctx, url, name: str = None):
             name
         )
     except Exception as e:
-        await send_clean(ctx, "that download didn't work out")
+        await send_clean(ctx, "that download didn't work out. if this keeps happening, YouTube probably changed something - try `pip install --upgrade yt-dlp` and restart me")
         print(e)
         return
 
