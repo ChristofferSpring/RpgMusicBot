@@ -5,7 +5,47 @@ import re
 import sys
 import math
 import audioop
+import json
+import subprocess
+import urllib.request
+from importlib.metadata import version, PackageNotFoundError
 from mytoken import TOKEN
+
+
+def _parse_ytdlp_version(v):
+    parts = []
+    for p in v.split("."):
+        try:
+            parts.append(int(p))
+        except ValueError:
+            parts.append(p)
+    return tuple(parts)
+
+
+def ensure_ytdlp_updated():
+    try:
+        installed = version("yt-dlp")
+    except PackageNotFoundError:
+        return
+    try:
+        with urllib.request.urlopen("https://pypi.org/pypi/yt-dlp/json", timeout=5) as resp:
+            latest = json.load(resp)["info"]["version"]
+    except Exception as e:
+        print(f"[startup] could not check yt-dlp version: {e}")
+        return
+    if _parse_ytdlp_version(latest) <= _parse_ytdlp_version(installed):
+        print(f"[startup] yt-dlp {installed} up to date")
+        return
+    print(f"[startup] yt-dlp {installed} outdated (latest {latest}), upgrading...")
+    try:
+        subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"], check=True)
+        print("[startup] yt-dlp upgraded, using new version this run")
+    except subprocess.CalledProcessError as e:
+        print(f"[startup] yt-dlp upgrade failed: {e}")
+
+
+ensure_ytdlp_updated()
+
 import yt_dlp
 import asyncio
 
