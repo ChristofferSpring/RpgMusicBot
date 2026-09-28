@@ -55,6 +55,14 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 MUSIC_FOLDER = "music"
 
+# Discord rejects messages over 2000 chars
+DISCORD_MSG_LIMIT = 2000
+
+# discord.py reads audio in 20ms frames
+FRAME_SECONDS = 0.02
+FADE_SECONDS = 1.5
+FADE_FRAMES = int(FADE_SECONDS / FRAME_SECONDS)
+
 COMMANDS_HELP = [
     ("!play <name>", "loops a song"),
     ("!sfx <name> [volume]", "layers a one-shot sound on top"),
@@ -72,12 +80,14 @@ class GuildState:
 
     def __init__(self):
         self.current_volume = 0.4
-        self.is_playing = False
-        self.current_music_path = None
+        # Bumped by every command that takes over playback. "after" callbacks
+        # from an older generation see the mismatch and do nothing, so a
+        # stopped/replaced track can't restart itself or advance the playlist.
+        self.generation = 0
         self.playlist = []
         self.playlist_index = 0
         self.playlist_mode = False
-        self.last_bot_message = None
+        self.last_bot_messages = []
 
 
 guild_states = {}
@@ -100,9 +110,7 @@ def get_music_files():
 
 
 def find_music_by_prefix(prefix):
-    # NOTE: don't call the builtin list() here - the `list` Discord command below
-    # shadows the builtin name at module scope once the bot is loaded.
-    names = [*get_music_files().keys()]
+    names = list(get_music_files().keys())
     prefix = prefix.lower()
 
     for name in names:
@@ -114,6 +122,10 @@ def find_music_by_prefix(prefix):
     return (matches[0] if len(matches) == 1 else None), matches
 
 
+def music_path(music_name):
+    return f"{MUSIC_FOLDER}/{get_music_files().get(music_name, f'{music_name}.mp3')}"
+
+
 def safe_filename(name):
     """Strip anything that could escape the music folder (path separators, traversal)."""
     if not name:
@@ -123,6 +135,73 @@ def safe_filename(name):
     name = re.sub(r'[^A-Za-z0-9 _.-]', '', name).strip()
 
     return name or None
+
+
+"""
+FADING AUDIO SOURCE
+
+Drop-in replacement for PCMVolumeTransformer that ramps the gain up over
+the first FADE_FRAMES frames (fade in), and can be told to ramp it back
+down with fade_out(). Once the fade out hits zero, read() returns b"",
+which discord.py treats as end of stream - so the normal "after" callback
+fires, exactly like the track had finished on its own.
+"""
+class FadingAudio(discord.PCMVolumeTransformer):
+    def __init__(self, original, volume, fade_in=FADE_FRAMES):
+        super().__init__(original, volume=volume)
+        self.fade_in_frames = fade_in
+        self.frames_read = 0
+        self.fade_out_frames = None
+        self.fade_out_left = 0
+
+    def fade_out(self, frames=FADE_FRAMES):
+        if self.fade_out_frames is None:
+            self.fade_out_frames = max(frames, 1)
+            self.fade_out_left = self.fade_out_frames
+
+    def read(self):
+        if self.fade_out_frames is not None and self.fade_out_left <= 0:
+            return b""
+
+        frame = self.original.read()
+        if not frame:
+            return frame
+
+        gain = min(self.volume, 2.0)
+        if self.frames_read < self.fade_in_frames:
+            gain *= (self.frames_read + 1) / self.fade_in_frames
+        self.frames_read += 1
+
+        if self.fade_out_frames is not None:
+            gain *= self.fade_out_left / self.fade_out_frames
+            self.fade_out_left -= 1
+
+        return audioop.mul(frame, 2, gain)
+
+
+def make_source(path, volume, fade_in=FADE_FRAMES):
+    return FadingAudio(discord.FFmpegPCMAudio(path), volume, fade_in=fade_in)
+
+
+async def fade_out_current(voice):
+    """Fades out whatever is playing and waits until it's gone.
+
+    Only stops the source it started fading - if another command swapped in
+    something new meanwhile, that one is left alone.
+    """
+    source = voice.source
+    if not voice.is_playing() or source is None:
+        return
+
+    if hasattr(source, "fade_out"):
+        source.fade_out()
+        for _ in range(int((FADE_SECONDS + 0.5) / 0.05)):
+            if not voice.is_playing() or voice.source is not source:
+                return
+            await asyncio.sleep(0.05)
+
+    if voice.is_playing() and voice.source is source:
+        voice.stop()
 
 
 """
@@ -180,6 +259,11 @@ class MixedAudioSource(discord.AudioSource):
 
         return audioop.add(base_frame, overlay_frame, 2)
 
+    def fade_out(self, frames=FADE_FRAMES):
+        for source in (self.base, self.overlay):
+            if hasattr(source, "fade_out"):
+                source.fade_out(frames)
+
     def is_opus(self):
         return False
 
@@ -193,9 +277,13 @@ async def ensure_voice_connected(ctx):
     """Connects to the author's voice channel if not already connected.
 
     Returns the VoiceClient, or None if it already sent an error message
-    (missing PyNaCl, connection timeout, etc) - in which case the caller
-    should just return.
+    (author not in voice, missing PyNaCl, connection timeout, etc) - in
+    which case the caller should just return.
     """
+    if not ctx.author.voice:
+        await send_clean(ctx, "you gotta be in a voice channel first")
+        return None
+
     if not ctx.voice_client:
         try:
             await ctx.author.voice.channel.connect()
@@ -208,6 +296,26 @@ async def ensure_voice_connected(ctx):
             return None
 
     return ctx.voice_client
+
+
+async def resolve_music(ctx, name):
+    """Prefix-matches a song name. Sends the error itself and returns None
+    when nothing or more than one song matches."""
+    music_name, matches = find_music_by_prefix(name)
+
+    if not music_name:
+        if len(matches) > 1:
+            message = "got a few that match, which one did you mean?\n"
+            message += "\n".join(f"- {m}" for m in matches)
+            await send_clean(ctx, message)
+        else:
+            await send_clean(ctx, "couldn't find that one")
+
+    return music_name
+
+
+def valid_volume(value):
+    return not math.isnan(value) and 0 <= value <= 2
 
 
 def download_audio(url, filename=None):
@@ -237,6 +345,28 @@ def download_audio(url, filename=None):
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
 
+def split_message(content, limit=DISCORD_MSG_LIMIT):
+    """Splits on line boundaries so each chunk fits in one Discord message."""
+    chunks = []
+    current = ""
+    for line in content.split("\n"):
+        while len(line) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 async def send_clean(ctx, content):
     state = get_state(ctx)
 
@@ -246,15 +376,15 @@ async def send_clean(ctx, content):
     except Exception:
         pass  # ignore if we don't have permission
 
-    # Delete the bot's last message, if it exists
-    try:
-        if state.last_bot_message:
-            await state.last_bot_message.delete()
-    except Exception:
-        pass
+    # Delete the bot's previous messages, if they exist
+    for message in state.last_bot_messages:
+        try:
+            await message.delete()
+        except Exception:
+            pass
 
-    # Send the new message and store it
-    state.last_bot_message = await ctx.send(content)
+    # Send the new message(s) and store them
+    state.last_bot_messages = [await ctx.send(chunk) for chunk in split_message(content)]
 
 @bot.event
 async def on_ready():
@@ -282,49 +412,34 @@ async def on_ready():
 async def play(ctx, name):
     state = get_state(ctx)
 
-    if not ctx.author.voice:
-        await send_clean(ctx, "you gotta be in a voice channel first")
-        return
-
     voice = await ensure_voice_connected(ctx)
     if voice is None:
         return
 
-    music_name, matches = find_music_by_prefix(name)
-
+    music_name = await resolve_music(ctx, name)
     if not music_name:
-        if len(matches) > 1:
-            message = "got a few that match, which one did you mean?\n"
-            message += "\n".join(f"- {m}" for m in matches)
-            await send_clean(ctx, message)
-        else:
-            await send_clean(ctx, "couldn't find that one")
         return
 
-    music_path = f"{MUSIC_FOLDER}/{get_music_files()[music_name]}"
+    path = music_path(music_name)
 
-    # A !play interrupts any running playlist
+    # A !play interrupts any running playlist or looping track
     state.playlist_mode = False
-    state.current_music_path = music_path
-    state.is_playing = True
+    state.generation += 1
+    generation = state.generation
 
-    if voice.is_playing():
-        voice.stop()
-    # Safe loop function
+    await fade_out_current(voice)
+    if state.generation != generation:
+        return  # another command took over while we were fading out
+
+    # Safe loop function - repeats skip the fade in so the loop is seamless
     def loop_audio(error):
-        if state.is_playing and voice.is_connected():
-            source = discord.PCMVolumeTransformer(
-                discord.FFmpegPCMAudio(state.current_music_path),
-                volume=state.current_volume
-            )
-            voice.play(source, after=loop_audio)
+        if error:
+            print(f"playback error: {error}")
+        if state.generation == generation and voice.is_connected():
+            voice.play(make_source(path, state.current_volume, fade_in=0), after=loop_audio)
 
     # Play for the first time
-    source = discord.PCMVolumeTransformer(
-        discord.FFmpegPCMAudio(state.current_music_path),
-        volume=state.current_volume
-    )
-    voice.play(source, after=loop_audio)
+    voice.play(make_source(path, state.current_volume), after=loop_audio)
 
     await send_clean(ctx, f"playing **{music_name}** on loop at volume {state.current_volume}, `!stop` when you've had enough")
 
@@ -333,11 +448,11 @@ async def play(ctx, name):
 async def stop(ctx):
     state = get_state(ctx)
 
-    state.is_playing = False  # Stop the loop
+    state.generation += 1  # Stop the loop / playlist
     state.playlist_mode = False
 
     if ctx.voice_client:
-        ctx.voice_client.stop()  # Stop the music
+        await fade_out_current(ctx.voice_client)  # Stop the music
         await send_clean(ctx, "stopped")
     else:
        await send_clean(ctx, "not even in a voice channel right now")
@@ -348,7 +463,7 @@ async def stop(ctx):
 async def volume(ctx, value: float):
     state = get_state(ctx)
 
-    if math.isnan(value) or value < 0 or value > 2:
+    if not valid_volume(value):
         await send_clean(ctx, "gotta be between 0.0 and 2.0")
         return
 
@@ -380,36 +495,22 @@ the sound once, with no loop.
 async def sfx(ctx, name, sfx_volume: float = None):
     state = get_state(ctx)
 
-    if not ctx.author.voice:
-        await send_clean(ctx, "you gotta be in a voice channel first")
-        return
-
     voice = await ensure_voice_connected(ctx)
     if voice is None:
         return
 
-    music_name, matches = find_music_by_prefix(name)
-
+    music_name = await resolve_music(ctx, name)
     if not music_name:
-        if len(matches) > 1:
-            message = "got a few that match, which one did you mean?\n"
-            message += "\n".join(f"- {m}" for m in matches)
-            await send_clean(ctx, message)
-        else:
-            await send_clean(ctx, "couldn't find that one")
         return
 
     if sfx_volume is None:
         sfx_volume = state.current_volume
-    elif math.isnan(sfx_volume) or sfx_volume < 0 or sfx_volume > 2:
+    elif not valid_volume(sfx_volume):
         await send_clean(ctx, "gotta be between 0.0 and 2.0")
         return
 
-    sfx_path = f"{MUSIC_FOLDER}/{get_music_files()[music_name]}"
-    sfx_source = discord.PCMVolumeTransformer(
-        discord.FFmpegPCMAudio(sfx_path),
-        volume=sfx_volume
-    )
+    # Sound effects hit immediately, no fade in
+    sfx_source = make_source(music_path(music_name), sfx_volume, fade_in=0)
 
     if voice.is_playing():
         # Hot-swap in a mix instead of stopping the current track
@@ -423,13 +524,12 @@ async def sfx(ctx, name, sfx_volume: float = None):
 async def upload(ctx, url, name: str = None):
     await send_clean(ctx, "on it, grabbing that...")
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     index = url.find('&list')
 
     # If '&list' is found, trim the URL up to that point
     if index != -1:
         url = url[:index]
-    print(url)
 
     try:
         await loop.run_in_executor(
@@ -447,21 +547,21 @@ async def upload(ctx, url, name: str = None):
         await send_clean(ctx, f"got it, **{name}** is ready. `!play {name}` whenever")
     else:
         await send_clean(ctx, "downloaded, use `!play <file-name>` to hear it")
-@bot.command()
-async def list(ctx):
-    if not os.path.isdir(MUSIC_FOLDER):
-        await send_clean(ctx, "can't find the music folder, something's off")
-        return
+
+
+@bot.command(name="list")
+async def list_songs(ctx):
+    message = "\n".join(f"`{cmd}` - {desc}" for cmd, desc in COMMANDS_HELP)
 
     musics = sorted(get_music_files().keys())
 
-    if not musics:
-        await send_clean(ctx, "nothing here yet")
-        return
-
-    message = "\n".join(f"`{cmd}` - {desc}" for cmd, desc in COMMANDS_HELP)
-    message += "\n\nhere's what I've got:\n"
-    message += "\n".join(f"- {m}" for m in musics)
+    if not os.path.isdir(MUSIC_FOLDER):
+        message += "\n\ncan't find the music folder, something's off"
+    elif not musics:
+        message += "\n\nno songs yet, grab some with `!upload`"
+    else:
+        message += "\n\nhere's what I've got:\n"
+        message += "\n".join(f"- {m}" for m in musics)
 
     await send_clean(ctx, message)
 
@@ -504,10 +604,10 @@ To stop the playlist:
 
 !stop
 """
-async def play_next(ctx):
+async def play_next(ctx, generation):
     state = get_state(ctx)
 
-    if not state.playlist_mode:
+    if not state.playlist_mode or state.generation != generation:
         return
 
     if state.playlist_index >= len(state.playlist):
@@ -521,25 +621,19 @@ async def play_next(ctx):
         state.playlist_mode = False
         return
 
-    if voice.is_playing():
-        voice.stop()
-
     music_name = state.playlist[state.playlist_index]
-    actual_file = get_music_files().get(music_name, f"{music_name}.mp3")
-    music_path = f"{MUSIC_FOLDER}/{actual_file}"
 
     await send_clean(ctx, f"now playing: **{music_name}** (volume {state.current_volume})")
 
-    source = discord.PCMVolumeTransformer(
-        discord.FFmpegPCMAudio(music_path),
-        volume=state.current_volume
-    )
+    source = make_source(music_path(music_name), state.current_volume)
 
     def after_playing(error):
         if error:
             print(f"playback error: {error}")
+        if state.generation != generation:
+            return  # replaced by !play / !stop / a new !allmusic
         state.playlist_index += 1
-        fut = asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
+        fut = asyncio.run_coroutine_threadsafe(play_next(ctx, generation), bot.loop)
         try:
             fut.result()
         except Exception as e:
@@ -551,28 +645,27 @@ async def play_next(ctx):
 async def allmusic(ctx):
     state = get_state(ctx)
 
-    if not ctx.author.voice:
-        await send_clean(ctx, "join a voice channel first")
-        return
-
     musics = sorted(get_music_files().keys())
 
     if not musics:
         await send_clean(ctx, "no music to play, folder's empty")
         return
 
-    if await ensure_voice_connected(ctx) is None:
+    voice = await ensure_voice_connected(ctx)
+    if voice is None:
         return
 
-    # An !allmusic interrupts any single looping track
-    state.is_playing = False
+    # An !allmusic interrupts any single looping track or older playlist
+    state.generation += 1
+    generation = state.generation
     state.playlist = musics
     state.playlist_index = 0
     state.playlist_mode = True
 
     await send_clean(ctx, f"kicking off {len(state.playlist)} songs")
 
-    await play_next(ctx)
+    await fade_out_current(voice)
+    await play_next(ctx, generation)
 
 """
 NEXT COMMAND
@@ -583,8 +676,8 @@ How it works:
 
 1. The bot checks if it is connected to a voice channel.
 2. It verifies that playlist mode is active.
-3. The current audio playback is stopped using voice.stop().
-4. Stopping the audio triggers the Discord "after" callback.
+3. The current track fades out (see fade_out_current()).
+4. The track ending triggers the Discord "after" callback.
 5. The callback automatically calls play_next(), which loads the next song.
 
 Usage:
@@ -598,8 +691,8 @@ Bot: skipping...
 
 This command only works when the playlist system (!allmusic) is active.
 """
-@bot.command()
-async def next(ctx):
+@bot.command(name="next")
+async def next_song(ctx):
     state = get_state(ctx)
 
     if not ctx.voice_client:
@@ -611,9 +704,13 @@ async def next(ctx):
         return
 
     if ctx.voice_client.is_playing():
-        ctx.voice_client.stop()  # This triggers the after callback and calls play_next()
         await send_clean(ctx, "skipping...")
+        # The track ending triggers the after callback, which calls play_next()
+        await fade_out_current(ctx.voice_client)
     else:
         await send_clean(ctx, "nothing's playing")
+
+
 # Start the bot
-bot.run(TOKEN)
+if __name__ == "__main__":
+    bot.run(TOKEN)

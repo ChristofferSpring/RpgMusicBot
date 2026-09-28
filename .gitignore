@@ -1,4 +1,10 @@
 # Ignorar arquivo de configuração com token
 mytoken.py
-__pycache__
-music
+__pycache__/
+.venv/
+musicdiscord.py
+
+# Downloaded tracks and runtime logs stay local
+music/*
+!music/download_music.py
+logs/
