@@ -6,10 +6,25 @@ import sys
 import math
 import audioop
 import json
+import logging
 import subprocess
+import threading
 import urllib.request
+from logging.handlers import RotatingFileHandler
 from importlib.metadata import version, PackageNotFoundError
 from mytoken import TOKEN
+
+LOG_FOLDER = "logs"
+os.makedirs(LOG_FOLDER, exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        RotatingFileHandler(f"{LOG_FOLDER}/bot.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8"),
+    ],
+)
+log = logging.getLogger("rpgmusicbot")
 
 
 def _parse_ytdlp_version(v):
@@ -31,17 +46,17 @@ def ensure_ytdlp_updated():
         with urllib.request.urlopen("https://pypi.org/pypi/yt-dlp/json", timeout=5) as resp:
             latest = json.load(resp)["info"]["version"]
     except Exception as e:
-        print(f"[startup] could not check yt-dlp version: {e}")
+        log.warning("could not check yt-dlp version: %s", e)
         return
     if _parse_ytdlp_version(latest) <= _parse_ytdlp_version(installed):
-        print(f"[startup] yt-dlp {installed} up to date")
+        log.info("yt-dlp %s up to date", installed)
         return
-    print(f"[startup] yt-dlp {installed} outdated (latest {latest}), upgrading...")
+    log.info("yt-dlp %s outdated (latest %s), upgrading...", installed, latest)
     try:
         subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"], check=True)
-        print("[startup] yt-dlp upgraded, using new version this run")
+        log.info("yt-dlp upgraded, using new version this run")
     except subprocess.CalledProcessError as e:
-        print(f"[startup] yt-dlp upgrade failed: {e}")
+        log.error("yt-dlp upgrade failed: %s", e)
 
 
 ensure_ytdlp_updated()
@@ -273,6 +288,24 @@ class MixedAudioSource(discord.AudioSource):
             self.overlay.cleanup()
 
 
+def carry_overlay(voice, new_source):
+    """Moves any unfinished !sfx from the source that just ended onto new_source.
+
+    Call it from an "after" callback, before voice.play(). discord.py runs
+    the callback before cleanup() on the old source, so detaching the
+    overlays here keeps that cleanup from killing them - otherwise a sound
+    effect gets cut off whenever the looping track restarts or the playlist
+    moves on. Handles stacked sfx (a mix wrapping another mix).
+    """
+    old = voice.source
+    while isinstance(old, MixedAudioSource):
+        if old.overlay is not None:
+            new_source = MixedAudioSource(new_source, old.overlay)
+            old.overlay = None
+        old = old.base
+    return new_source
+
+
 async def ensure_voice_connected(ctx):
     """Connects to the author's voice channel if not already connected.
 
@@ -318,7 +351,18 @@ def valid_volume(value):
     return not math.isnan(value) and 0 <= value <= 2
 
 
+# One download at a time, so cleaning up after a failed one can't delete
+# files that another download is still writing.
+download_lock = threading.Lock()
+
+
 def download_audio(url, filename=None):
+    """Downloads url as an mp3 into MUSIC_FOLDER and returns the song name.
+
+    Raises FileExistsError (with the song name) instead of overwriting a
+    song that's already there. Whatever a failed download leaves behind
+    (.part, .webm, a half-converted .mp3) is deleted.
+    """
     filename = safe_filename(filename)
     output_template = f"{MUSIC_FOLDER}/{filename}.%(ext)s" if filename else f"{MUSIC_FOLDER}/%(title)s.%(ext)s"
 
@@ -342,8 +386,31 @@ def download_audio(url, filename=None):
         'geo_bypass': True,
     }
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
+    with download_lock:
+        os.makedirs(MUSIC_FOLDER, exist_ok=True)
+        files_before = set(os.listdir(MUSIC_FOLDER))
+        succeeded = False
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                # Resolve the title first so we know the final filename
+                # before downloading anything
+                info = ydl.extract_info(url, download=False, process=False)
+                song_name = os.path.splitext(os.path.basename(ydl.prepare_filename(info)))[0]
+                if os.path.exists(f"{MUSIC_FOLDER}/{song_name}.mp3"):
+                    raise FileExistsError(song_name)
+                ydl.process_ie_result(info, download=True)
+            succeeded = True
+        finally:
+            for f in set(os.listdir(MUSIC_FOLDER)) - files_before:
+                if succeeded and f.lower().endswith(".mp3"):
+                    continue
+                try:
+                    os.remove(f"{MUSIC_FOLDER}/{f}")
+                    log.info("removed leftover download file %s", f)
+                except OSError as e:
+                    log.warning("could not remove leftover %s: %s", f, e)
+
+    return song_name
 
 def split_message(content, limit=DISCORD_MSG_LIMIT):
     """Splits on line boundaries so each chunk fits in one Discord message."""
@@ -388,9 +455,9 @@ async def send_clean(ctx, content):
 
 @bot.event
 async def on_ready():
-    print(f"Bot connected as {bot.user}")
+    log.info("Bot connected as %s", bot.user)
     try:
-        print(f"Python executable: {sys.executable}")
+        log.info("Python executable: %s", sys.executable)
     except Exception:
         pass
     # Detect available voice backends
@@ -405,7 +472,7 @@ async def on_ready():
         backends.append('davey')
     except Exception:
         pass
-    print(f"Voice backends available: {', '.join(backends) if backends else 'none'}")
+    log.info("Voice backends available: %s", ', '.join(backends) if backends else 'none')
 
 # Command to play music in loop
 @bot.command()
@@ -427,19 +494,48 @@ async def play(ctx, name):
     state.generation += 1
     generation = state.generation
 
+    if voice.is_playing():
+        # The fade out takes a moment, don't leave the user wondering
+        await send_clean(ctx, f"switching to **{music_name}**...")
+
     await fade_out_current(voice)
     if state.generation != generation:
         return  # another command took over while we were fading out
 
+    def notify(message):
+        # "after" callbacks run on the audio thread, not the event loop
+        asyncio.run_coroutine_threadsafe(send_clean(ctx, message), bot.loop)
+
+    current = None
+
     # Safe loop function - repeats skip the fade in so the loop is seamless
     def loop_audio(error):
+        nonlocal current
         if error:
-            print(f"playback error: {error}")
-        if state.generation == generation and voice.is_connected():
-            voice.play(make_source(path, state.current_volume, fade_in=0), after=loop_audio)
+            log.error("playback error on %s: %s", path, error)
+        if state.generation != generation or not voice.is_connected():
+            return
+        if current.frames_read == 0:
+            # Ended without a single frame: corrupt/unreadable file. Looping
+            # would respawn ffmpeg in a tight loop forever.
+            log.error("%s produced no audio, not looping it", path)
+            notify(f"**{music_name}** has no playable audio (corrupt file?), stopped")
+            return
+        try:
+            current = make_source(path, state.current_volume, fade_in=0)
+            voice.play(carry_overlay(voice, current), after=loop_audio)
+        except discord.ClientException as e:
+            log.error("could not restart %s: %s", path, e)
+            notify(f"lost **{music_name}**: {e}")
 
     # Play for the first time
-    voice.play(make_source(path, state.current_volume), after=loop_audio)
+    try:
+        current = make_source(path, state.current_volume)
+        voice.play(current, after=loop_audio)
+    except discord.ClientException as e:
+        log.error("could not play %s: %s", path, e)
+        await send_clean(ctx, f"couldn't play **{music_name}**: {e}")
+        return
 
     await send_clean(ctx, f"playing **{music_name}** on loop at volume {state.current_volume}, `!stop` when you've had enough")
 
@@ -452,8 +548,9 @@ async def stop(ctx):
     state.playlist_mode = False
 
     if ctx.voice_client:
-        await fade_out_current(ctx.voice_client)  # Stop the music
+        # Answer first, the fade out takes a moment
         await send_clean(ctx, "stopped")
+        await fade_out_current(ctx.voice_client)  # Stop the music
     else:
        await send_clean(ctx, "not even in a voice channel right now")
 
@@ -510,7 +607,12 @@ async def sfx(ctx, name, sfx_volume: float = None):
         return
 
     # Sound effects hit immediately, no fade in
-    sfx_source = make_source(music_path(music_name), sfx_volume, fade_in=0)
+    try:
+        sfx_source = make_source(music_path(music_name), sfx_volume, fade_in=0)
+    except discord.ClientException as e:
+        log.error("could not open sfx %s: %s", music_name, e)
+        await send_clean(ctx, f"couldn't play **{music_name}**: {e}")
+        return
 
     if voice.is_playing():
         # Hot-swap in a mix instead of stopping the current track
@@ -532,21 +634,23 @@ async def upload(ctx, url, name: str = None):
         url = url[:index]
 
     try:
-        await loop.run_in_executor(
+        song_name = await loop.run_in_executor(
             None,
             download_audio,
             url,
             name
         )
-    except Exception as e:
+    except FileExistsError as e:
+        await send_clean(ctx, f"already got a song called **{e.args[0]}**, give it another name: `!upload <url> <name>`")
+        return
+    except Exception:
+        log.exception("download failed for %s", url)
         await send_clean(ctx, "that download didn't work out. if this keeps happening, YouTube probably changed something - try `pip install --upgrade yt-dlp` and restart me")
-        print(e)
         return
 
-    if name:
-        await send_clean(ctx, f"got it, **{name}** is ready. `!play {name}` whenever")
-    else:
-        await send_clean(ctx, "downloaded, use `!play <file-name>` to hear it")
+    # Names with spaces need quotes, or !play only sees the first word
+    play_arg = f'"{song_name}"' if " " in song_name else song_name
+    await send_clean(ctx, f"got it, **{song_name}** is ready. `!play {play_arg}` whenever")
 
 
 @bot.command(name="list")
@@ -604,7 +708,7 @@ To stop the playlist:
 
 !stop
 """
-async def play_next(ctx, generation):
+async def play_next(ctx, generation, carry_sfx=False):
     state = get_state(ctx)
 
     if not state.playlist_mode or state.generation != generation:
@@ -623,23 +727,31 @@ async def play_next(ctx, generation):
 
     music_name = state.playlist[state.playlist_index]
 
-    await send_clean(ctx, f"now playing: **{music_name}** (volume {state.current_volume})")
-
-    source = make_source(music_path(music_name), state.current_volume)
-
     def after_playing(error):
         if error:
-            print(f"playback error: {error}")
+            log.error("playback error on %s: %s", music_name, error)
         if state.generation != generation:
             return  # replaced by !play / !stop / a new !allmusic
+        if source.frames_read == 0:
+            log.warning("%s produced no audio (corrupt file?), skipping", music_name)
         state.playlist_index += 1
-        fut = asyncio.run_coroutine_threadsafe(play_next(ctx, generation), bot.loop)
+        fut = asyncio.run_coroutine_threadsafe(play_next(ctx, generation, carry_sfx=True), bot.loop)
         try:
             fut.result()
-        except Exception as e:
-            print(f"play_next failed: {e}")
+        except Exception:
+            log.exception("play_next failed")
 
-    voice.play(source, after=after_playing)
+    try:
+        source = make_source(music_path(music_name), state.current_volume)
+        # Only when moving on by itself: a !sfx still ringing out carries over
+        voice.play(carry_overlay(voice, source) if carry_sfx else source, after=after_playing)
+    except discord.ClientException as e:
+        log.error("could not play %s: %s", music_name, e)
+        state.playlist_mode = False
+        await send_clean(ctx, f"couldn't play **{music_name}**: {e}. stopping the playlist")
+        return
+
+    await send_clean(ctx, f"now playing: **{music_name}** (volume {state.current_volume})")
 
 @bot.command()
 async def allmusic(ctx):
@@ -713,4 +825,5 @@ async def next_song(ctx):
 
 # Start the bot
 if __name__ == "__main__":
-    bot.run(TOKEN)
+    # log_handler=None: discord.py logs go through the logging setup at the top
+    bot.run(TOKEN, log_handler=None)

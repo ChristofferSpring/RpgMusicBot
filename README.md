@@ -39,4 +39,5 @@ On startup the bot checks yt-dlp against PyPI and auto-upgrades itself if outdat
 - Tracks fade in/out (1.5s, `FADE_SECONDS` in `bot.py`) on `!play`, `!allmusic`, `!next` and `!stop`. Loop repeats and `!sfx` start instantly.
 - State (current track, volume, playlist position) is scoped per guild.
 - Downloaded tracks land in `music/` (gitignored).
-- Logs go to `logs/`.
+- Logs go to the console and `logs/bot.log` (rotates at 1MB, keeps 3 old files).
+- `!upload` refuses to overwrite a song that already exists and cleans up after failed downloads.
